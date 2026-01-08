@@ -379,6 +379,7 @@ The token is stored in `localStorage` under the key `git.token`:
 ### Google OAuth not working
 - Check that the Supabase callback URL is added to Google Cloud Console authorized redirect URIs
 - Verify Google provider is enabled in Supabase Authentication settings
+- **Important**: If your OAuth consent screen is in "Testing" mode, only users added to the test users list can sign in. To allow any Google user, go to Google Cloud Console → OAuth consent screen → click "Publish App" to move to production
 
 ### Redirect issues after auth
 - Ensure the worker callback URL is added to Supabase redirect URLs
