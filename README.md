@@ -182,13 +182,13 @@ The email must match the Google account email you'll use to sign in.
 After deploying, add your worker callback URL to Supabase:
 
 1. Go to Supabase Dashboard → Authentication → URL Configuration
-2. Add to "Redirect URLs":
+2. Add to "Redirect URLs" (use wildcard `**` to allow query parameters):
    ```
-   https://sveltia-auth-proxy.<your-subdomain>.workers.dev/callback
+   https://sveltia-auth-proxy.<your-subdomain>.workers.dev/**
    ```
    For local development, also add:
    ```
-   http://localhost:8787/callback
+   http://localhost:8787/**
    ```
 
 ### 9. Configure Your CMS Site
@@ -382,12 +382,13 @@ The token is stored in `localStorage` under the key `git.token`:
 - **Important**: If your OAuth consent screen is in "Testing" mode, only users added to the test users list can sign in. To allow any Google user, go to Google Cloud Console → OAuth consent screen → click "Publish App" to move to production
 
 ### Redirect issues after auth
-- Ensure the worker callback URL is added to Supabase redirect URLs
+- Ensure the worker callback URL is added to Supabase redirect URLs with wildcard: `https://your-worker.workers.dev/**`
+- The wildcard `**` is required to allow query parameters like `?redirect_uri=...`
 - Check that `redirect_uri` is being passed correctly
 
 ### Local development issues
 - Make sure `.dev.vars` file exists with correct values
-- Add `http://localhost:8787/callback` to Supabase redirect URLs
+- Add `http://localhost:8787/**` to Supabase redirect URLs (with wildcard)
 
 ## Local Development
 
