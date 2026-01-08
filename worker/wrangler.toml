@@ -1,0 +1,11 @@
+name = "sveltia-auth-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+# SUPABASE_URL = "https://your-project.supabase.co"
+# SUPABASE_ANON_KEY = "your-anon-key"
+
+# Secrets (set via `wrangler secret put <NAME>`)
+# - SUPABASE_SERVICE_KEY
+# - GITHUB_PAT
