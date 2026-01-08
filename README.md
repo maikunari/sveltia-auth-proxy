@@ -11,7 +11,7 @@ A Cloudflare Worker-based authentication proxy for Sveltia CMS with Supabase bac
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── wrangler.toml       # Wrangler configuration
-│   └── .dev.vars.example   # Example environment variables
+│   └── dev.vars.example    # Example environment variables
 ├── supabase/               # Supabase configuration
 │   ├── config.toml
 │   └── migrations/         # Database migrations
@@ -130,7 +130,7 @@ The email must match the Google account email you'll use to sign in.
 
 3. Copy the example environment file for local development:
    ```bash
-   cp .dev.vars.example .dev.vars
+   cp dev.vars.example .dev.vars
    ```
 
 4. Edit `.dev.vars` with your actual values from steps 1-2:
