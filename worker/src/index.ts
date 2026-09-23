@@ -620,4 +620,21 @@ app.post('/auth', async (c) => {
   });
 });
 
-export default app;
+// Cron-triggered keepalive: Supabase pauses free projects after ~7 days
+// without database activity, and health-check endpoints don't count.
+// A real query against a table does.
+async function keepSupabaseAlive(env: Bindings) {
+  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+  const { error } = await supabase.from('sites').select('id').limit(1);
+  if (error) {
+    throw new Error(`Supabase keepalive query failed: ${error.message}`);
+  }
+  console.log('Supabase keepalive query succeeded');
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    ctx.waitUntil(keepSupabaseAlive(env));
+  },
+};
