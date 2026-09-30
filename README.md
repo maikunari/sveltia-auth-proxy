@@ -230,7 +230,7 @@ If any of these is missing, `/auth` shows "not configured yet" and the Worker lo
 - Add `https://<your-worker-host>/callback` exactly to the OAuth client's authorized redirect URIs.
 
 ### Google OAuth not working for some users
-- **Important**: If your OAuth consent screen is in "Testing" mode, only users added to the test users list can sign in. To allow any Google user, go to Google Cloud Console → OAuth consent screen → click "Publish App" to move to production.
+- The OAuth consent screen is probably still in "Testing" mode. Publish it or add the editors as test users (see step 1). Who may actually sign in is still controlled by `ALLOWED_EMAILS`.
 
 ## Local Development
 
