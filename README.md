@@ -1,220 +1,150 @@
 # Sveltia Auth Proxy
 
-A Cloudflare Worker-based authentication proxy for Sveltia CMS with Supabase backend. Provides multi-tenant authentication with support for Google OAuth, email/password, and magic link sign-in methods.
+A Cloudflare Worker that lets a small, fixed list of people sign in to a [Sveltia CMS](https://github.com/sveltia/sveltia-cms) admin with their Google account, without giving them GitHub accounts.
+
+The Worker signs people in with Google OAuth, checks their email against an allow-list stored in the Worker's own configuration, and hands the CMS a GitHub token that can only edit one repository. There is no database, so nothing can pause and no keep-alive job is needed.
 
 ## Project Structure
 
 ```
 ├── worker/                 # Cloudflare Worker (Hono framework)
 │   ├── src/
-│   │   └── index.ts        # Main worker entry point
+│   │   ├── index.ts        # Routes: /auth and /callback
+│   │   └── auth.ts         # Pure helpers (allow-list, redirect and token checks)
+│   ├── test/               # node --test suites
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── wrangler.toml       # Wrangler configuration
-│   └── dev.vars.example    # Example environment variables
-├── supabase/               # Supabase configuration
-│   ├── config.toml
-│   └── migrations/         # Database migrations
+│   └── dev.vars.example    # Example local configuration
 └── README.md
 ```
 
-## Features
+## How it works
 
-- **Multi-tenant support**: Each site has its own branding (logo, name, primary color)
-- **Multiple auth methods**: Google OAuth, email/password, magic link
-- **User authorization**: Only users in the `users` table can access their assigned site
-- **Repository validation**: Ensures users can only access their authorized GitHub repo
-- **Redirect-based auth flow**: Works cross-origin between worker and CMS site
+1. The CMS admin page sends the browser to `/auth?redirect_uri=https://your-site.com/admin/`.
+2. The Worker checks that `redirect_uri` is on an allowed origin, then sends the browser to Google's sign-in page.
+3. Google sends the browser back to `/callback`. The Worker exchanges the code with Google (with PKCE and a state cookie) and reads the verified email address.
+4. If the email is in `ALLOWED_EMAILS`, the Worker checks that `GITHUB_PAT` can still write to `GITHUB_REPO`, then redirects to `redirect_uri#auth_token=<GITHUB_PAT>&expires_in=<seconds>`.
+   - `expires_in` is the real number of seconds until the PAT expires, read from GitHub. It is left out if the PAT has no expiry date.
+5. Anything else (email not allowed, Google cancelled, PAT expired or missing access) shows an error page on the Worker with a "Try a different Google account" link. The token is never sent back in those cases.
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) (v18 or later)
+- [Node.js](https://nodejs.org/) v18 or later (v22.18 or later to run the tests)
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up)
-- A [Supabase account](https://supabase.com)
-- A [GitHub account](https://github.com) with a Personal Access Token
-- A [Google Cloud Console](https://console.cloud.google.com/) project (for Google OAuth)
+- A [GitHub account](https://github.com) with write access to the site's repository
+- A [Google Cloud Console](https://console.cloud.google.com/) project (for the Google OAuth client)
 
 ## Setup
 
-### 1. Create a GitHub Personal Access Token
+### 1. Create a Google OAuth client
 
-1. Go to GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
-2. Click "Generate new token (classic)"
-3. Give it a descriptive name (e.g., "Sveltia CMS Auth")
-4. Select scopes:
-   - `repo` (Full control of private repositories)
-5. Click "Generate token" and copy the token (starts with `ghp_`)
-6. Save this token securely - you'll need it later
-
-### 2. Create a Supabase Project
-
-1. Go to [supabase.com](https://supabase.com) and create a new project
-2. Wait for the project to be provisioned
-3. Go to Project Settings → API and note down:
-   - **Project URL** (e.g., `https://xxxxx.supabase.co`)
-   - **anon/public key** (safe to expose in browser)
-   - **service_role key** (keep secret - has admin access)
-
-### 3. Configure Google OAuth in Supabase
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Go to "APIs & Services" → "OAuth consent screen"
-   - Choose "External" user type
-   - Fill in app name, user support email, developer contact
-   - Add scopes: `email`, `profile`, `openid`
-   - Add test users if in testing mode
-4. Go to "APIs & Services" → "Credentials"
-   - Click "Create Credentials" → "OAuth client ID"
-   - Application type: "Web application"
-   - Name: "Sveltia Auth Proxy"
-   - Authorized redirect URIs: Add your Supabase callback URL:
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
+2. Go to "APIs & Services" → "OAuth consent screen".
+   - Choose "External" user type.
+   - Fill in app name, user support email and developer contact.
+   - Add scopes: `email`, `openid`.
+   - While the app is in "Testing" mode, only listed test users can sign in. Publish it (no Google review is needed for these scopes) or add every editor as a test user.
+3. Go to "APIs & Services" → "Credentials" → "Create Credentials" → "OAuth client ID".
+   - Application type: "Web application".
+   - Authorized redirect URIs:
      ```
-     https://<your-project-ref>.supabase.co/auth/v1/callback
+     https://sveltia-auth-proxy.<your-subdomain>.workers.dev/callback
+     http://localhost:8787/callback
      ```
-   - Click "Create" and copy the **Client ID** and **Client Secret**
-5. In Supabase Dashboard:
-   - Go to Authentication → Providers → Google
-   - Enable Google provider
-   - Paste the Client ID and Client Secret from Google
-   - Save
+     (The second one is only needed for local development.)
+   - Copy the **Client ID** and **Client Secret**.
 
-### 4. Apply Database Migrations
+An existing OAuth client works too: add the Worker's `/callback` URL to its authorized redirect URIs. If Google no longer shows the old client secret, use "Add secret" on the client to create a new one.
 
-Install the Supabase CLI and apply migrations:
+### 2. Create a fine-grained GitHub token for the one repository
+
+Use a **fine-grained** personal access token, never a classic token. Every signed-in editor's browser receives this token, so it must only be able to touch the site's repository.
+
+1. Go to GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → "Generate new token".
+2. Token name: e.g. `Sveltia CMS – owner/repo`.
+3. Resource owner: the account or organization that owns the repository.
+4. Expiration: pick a date (for example 90 days or 1 year) and put a reminder in your calendar to rotate it. The Worker logs a warning in the last 14 days, and once it expires editors get a clear error instead of a broken CMS.
+5. Repository access: **Only select repositories** → select the site's repository only.
+6. Permissions → Repository permissions:
+   - **Contents: Read and write**
+   - **Metadata: Read-only** (selected automatically)
+   - Leave everything else as "No access".
+7. Generate the token and copy it (starts with `github_pat_`).
+
+### 3. Install and configure the Worker
 
 ```bash
-# Install Supabase CLI (if not already installed)
-npm install -g supabase
-
-# Login to Supabase
-supabase login
-
-# Link to your project (find project ref in Supabase dashboard URL)
-supabase link --project-ref <your-project-ref>
-
-# Apply migrations
-supabase db push
+cd worker
+npm install
+npx wrangler login
 ```
 
-### 5. Add Sites and Users to Database
+Set the configuration as Worker secrets. They are secrets so that per-site values stay out of this public repository and survive `wrangler deploy`:
 
-In Supabase Dashboard → SQL Editor, run:
-
-```sql
--- Add a site
-INSERT INTO sites (slug, github_repo, brand_name, primary_color)
-VALUES ('my-site', 'owner/repo', 'My Site CMS', '#6366f1');
-
--- Get the site ID
-SELECT id FROM sites WHERE slug = 'my-site';
-
--- Add an authorized user (replace <site-uuid> with the ID from above)
-INSERT INTO users (email, site_id, role)
-VALUES ('your-email@example.com', '<site-uuid>', 'admin');
+```bash
+npx wrangler secret put GOOGLE_CLIENT_ID          # from step 1
+npx wrangler secret put GOOGLE_CLIENT_SECRET      # from step 1
+npx wrangler secret put ALLOWED_EMAILS            # e.g. editor@example.com,seo@example.com
+npx wrangler secret put ALLOWED_REDIRECT_ORIGINS  # e.g. https://example.com,https://www.example.com
+npx wrangler secret put GITHUB_REPO               # e.g. owner/repo
+npx wrangler secret put GITHUB_PAT                # from step 2
 ```
 
-The email must match the Google account email you'll use to sign in.
+### 4. Deploy
 
-### 6. Set Up Cloudflare Worker
-
-1. Navigate to the worker directory:
-   ```bash
-   cd worker
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Copy the example environment file for local development:
-   ```bash
-   cp dev.vars.example .dev.vars
-   ```
-
-4. Edit `.dev.vars` with your actual values from steps 1-2:
-   ```
-   SUPABASE_URL=https://your-project.supabase.co
-   SUPABASE_ANON_KEY=your-anon-key
-   SUPABASE_SERVICE_KEY=your-service-role-key
-   GITHUB_PAT=ghp_your-personal-access-token
-   ```
-
-5. Test locally:
-   ```bash
-   npm run dev
-   ```
-
-   Visit `http://localhost:8787` - you should see `{"message":"Sveltia Auth Proxy is running"}`
-
-### 7. Deploy to Cloudflare
-
-1. Login to Cloudflare (if not already):
-   ```bash
-   npx wrangler login
-   ```
-
-2. Set production secrets:
-   ```bash
-   npx wrangler secret put SUPABASE_URL
-   # Enter: https://your-project.supabase.co
-
-   npx wrangler secret put SUPABASE_ANON_KEY
-   # Enter: your-anon-key
-
-   npx wrangler secret put SUPABASE_SERVICE_KEY
-   # Enter: your-service-role-key
-
-   npx wrangler secret put GITHUB_PAT
-   # Enter: ghp_your-personal-access-token
-   ```
-
-3. Deploy:
-   ```bash
-   npm run deploy
-   ```
-
-4. Note your worker URL (e.g., `https://sveltia-auth-proxy.<your-subdomain>.workers.dev`)
-
-### 8. Update Supabase Redirect URLs
-
-After deploying, add your worker callback URL to Supabase:
-
-1. Go to Supabase Dashboard → Authentication → URL Configuration
-2. Add to "Redirect URLs" (use wildcard `**` to allow query parameters):
-   ```
-   https://sveltia-auth-proxy.<your-subdomain>.workers.dev/**
-   ```
-   For local development, also add:
-   ```
-   http://localhost:8787/**
-   ```
-
-### 9. Configure Your CMS Site
-
-In your Sveltia CMS site, configure the backend to use your auth proxy:
-
-```yaml
-# In your CMS config (e.g., admin/config.yml)
-backend:
-  name: github
-  repo: owner/repo
-  branch: main
-  base_url: https://sveltia-auth-proxy.<your-subdomain>.workers.dev
-  auth_endpoint: /auth
+```bash
+npm run deploy
 ```
 
-Or if using the redirect flow, your site should redirect to:
+Note your worker URL (e.g., `https://sveltia-auth-proxy.<your-subdomain>.workers.dev`) and make sure its `/callback` is in the Google client's authorized redirect URIs (step 1).
+
+### 5. Configure your CMS site
+
+Your admin page sends people to:
+
 ```
 https://sveltia-auth-proxy.<your-subdomain>.workers.dev/auth?redirect_uri=https://your-site.com/admin/
 ```
 
+The origin of `redirect_uri` (`https://your-site.com`) must be listed in `ALLOWED_REDIRECT_ORIGINS`. See "Client Integration" below for the page that receives the token.
+
+## Upgrading from the Supabase-backed version
+
+Earlier versions kept users in a Supabase `users` table and signed in through Supabase Auth. This version needs no Supabase at all. To switch an existing deployment:
+
+1. Note the emails in the Supabase `users` table and the `github_repo` of the site (from the `sites` table). This version serves one site per Worker; if the `sites` table has more than one row, deploy a separate Worker per site.
+2. Add `https://<your-worker-host>/callback` to the Google OAuth client that Supabase used (step 1 above), and get its client ID and secret.
+3. Create the fine-grained token (step 2 above).
+4. Set the six secrets (step 3 above). Setting `GITHUB_PAT` first is safe: the old code keeps working with the new token.
+5. `npm run deploy`. This also removes the old daily Supabase keep-alive cron (`crons = []` in `wrangler.toml`).
+6. Sign in through the CMS to check it works, then revoke the old classic token on GitHub.
+7. Once you are happy, delete the old secrets (`npx wrangler secret delete SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`), any external keep-alive job, and the Supabase project.
+
+To roll back before step 7, run `npx wrangler rollback` in `worker/`. It restores the version before the last deploy, including the secrets it had at the time.
+
+## Managing editors
+
+The allow-list is the `ALLOWED_EMAILS` secret: a comma-separated list of Google account emails, matched case-insensitively. To add or remove someone, set the whole list again:
+
+```bash
+cd worker
+npx wrangler secret put ALLOWED_EMAILS
+```
+
+The change takes effect immediately; no redeploy is needed. Removing someone stops them signing in again, but a token already stored in their browser keeps working until you rotate `GITHUB_PAT`.
+
+## Rotating the GitHub token
+
+1. Create a new fine-grained token as in step 2.
+2. `npx wrangler secret put GITHUB_PAT` and paste the new token.
+3. Sign in once through the CMS to check it works, then delete the old token on GitHub.
+
+Editors whose browsers still hold the old token need to sign out of the CMS and sign in again.
+
 ## Client Integration
 
-Your CMS admin page needs to handle the authentication response. After successful auth, the user is redirected back to your `redirect_uri` with the token in the URL fragment.
-
-### Handling the Auth Response
+After a successful sign-in the browser lands on your `redirect_uri` with the token in the URL fragment. Store it where Sveltia CMS looks for it (`sveltia-cms.user` in `localStorage`) before the CMS loads:
 
 ```html
 <!-- admin/index.html -->
@@ -223,94 +153,36 @@ Your CMS admin page needs to handle the authentication response. After successfu
 <head>
   <meta charset="UTF-8">
   <title>CMS Admin</title>
-  <script src="https://unpkg.com/sveltia-cms/dist/sveltia-cms.js"></script>
 </head>
 <body>
   <script>
-    // Handle auth callback - this runs before Sveltia CMS initializes
     (function() {
-      const hash = window.location.hash.substring(1);
-      if (!hash) return;
+      const AUTH_URL = 'https://sveltia-auth-proxy.<your-subdomain>.workers.dev/auth';
+      const TOKEN_KEY = 'sveltia-cms.user';
 
-      const params = new URLSearchParams(hash);
+      const params = new URLSearchParams(window.location.hash.substring(1));
       const token = params.get('auth_token');
-      const error = params.get('auth_error');
-      const expiresIn = params.get('expires_in');
+      if (token) {
+        localStorage.setItem(TOKEN_KEY, JSON.stringify({ backendName: 'github', token }));
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
 
-      if (error) {
-        console.error('Auth error:', error);
-        alert('Authentication failed: ' + error);
-        // Clear the hash
-        history.replaceState(null, '', window.location.pathname);
+      if (!localStorage.getItem(TOKEN_KEY)) {
+        const redirectUri = encodeURIComponent(window.location.origin + window.location.pathname);
+        window.location.href = AUTH_URL + '?redirect_uri=' + redirectUri;
         return;
       }
 
-      if (token) {
-        // Store the token for Sveltia CMS to use
-        const expiresAt = Date.now() + (parseInt(expiresIn, 10) * 1000);
-        localStorage.setItem('git.token', JSON.stringify({
-          token: token,
-          expires_at: expiresAt
-        }));
-
-        // Clear the hash and reload to initialize CMS with token
-        history.replaceState(null, '', window.location.pathname);
-        window.location.reload();
-      }
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/@sveltia/cms/dist/sveltia-cms.js';
+      document.body.appendChild(script);
     })();
   </script>
 </body>
 </html>
 ```
 
-### Initiating Authentication
-
-If you need to manually trigger auth (e.g., a custom login button):
-
-```javascript
-function login() {
-  const authUrl = 'https://sveltia-auth-proxy.<your-subdomain>.workers.dev/auth';
-  const redirectUri = encodeURIComponent(window.location.href);
-  const site = 'my-site'; // Optional: for custom branding
-
-  window.location.href = `${authUrl}?redirect_uri=${redirectUri}&site=${site}`;
-}
-```
-
-### Checking Auth Status
-
-```javascript
-function isAuthenticated() {
-  try {
-    const stored = localStorage.getItem('git.token');
-    if (!stored) return false;
-
-    const { token, expires_at } = JSON.parse(stored);
-    return token && expires_at > Date.now();
-  } catch {
-    return false;
-  }
-}
-
-function logout() {
-  localStorage.removeItem('git.token');
-  window.location.reload();
-}
-```
-
-### Token Storage Format
-
-The token is stored in `localStorage` under the key `git.token`:
-
-```json
-{
-  "token": "ghp_xxxxxxxxxxxx",
-  "expires_at": 1704672000000
-}
-```
-
-- `token`: The GitHub PAT for repository access
-- `expires_at`: Unix timestamp (milliseconds) when the token expires (8 hours from auth)
+`expires_in` (when present) is the number of seconds until the GitHub token itself expires. You can use it to send people back to `/auth` before that happens.
 
 ## API Endpoints
 
@@ -318,96 +190,59 @@ The token is stored in `localStorage` under the key `git.token`:
 |----------|--------|-------------|
 | `/` | GET | Health check, returns status message |
 | `/health` | GET | Health check endpoint |
-| `/auth` | GET | Serves the auth UI page |
-| `/auth` | POST | Legacy token validation endpoint |
-| `/callback` | GET | OAuth callback handler |
-| `/callback/validate` | POST | Validates Supabase token, returns GitHub PAT |
-| `/api/site/:slug` | GET | Get site branding information |
+| `/auth` | GET | Starts Google sign-in. Query: `redirect_uri` (required, must be on an allowed origin) |
+| `/callback` | GET | Google OAuth callback. Redirects to `redirect_uri#auth_token=...&expires_in=...` on success, or shows an error page |
 
-### Auth Flow
+## Configuration
 
-1. CMS redirects to `/auth?redirect_uri=https://your-site.com/admin/`
-2. User authenticates via Google, email/password, or magic link
-3. Worker validates user exists in `users` table
-4. On success, redirects back to `redirect_uri#auth_token=<github_pat>&expires_in=28800`
-5. On error, redirects back with `redirect_uri#auth_error=<message>`
+All values are Worker secrets (`wrangler secret put <NAME>`), or lines in `worker/.dev.vars` for local development.
 
-### Query Parameters for `/auth`
+| Name | Description |
+|------|-------------|
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+| `ALLOWED_EMAILS` | Comma-separated Google account emails allowed to sign in |
+| `ALLOWED_REDIRECT_ORIGINS` | Comma-separated site origins the token may be sent to, e.g. `https://www.example.com` (scheme + host, no path) |
+| `GITHUB_REPO` | The repository the CMS edits, as `owner/repo` |
+| `GITHUB_PAT` | Fine-grained PAT limited to `GITHUB_REPO` with Contents read/write |
 
-| Parameter | Description |
-|-----------|-------------|
-| `redirect_uri` | URL to redirect back to after authentication |
-| `site` | Site slug for custom branding (optional) |
+If any of these is missing, `/auth` shows "not configured yet" and the Worker log names the missing setting.
 
-## Database Schema
+## Security notes
 
-### sites
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| slug | TEXT | Unique site identifier |
-| github_repo | TEXT | GitHub repo in `owner/repo` format |
-| logo_url | TEXT | URL to site logo (optional) |
-| brand_name | TEXT | Display name for auth page |
-| primary_color | TEXT | Hex color for buttons/accents |
-| created_at | TIMESTAMPTZ | Creation timestamp |
-
-### users
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| email | TEXT | User email address |
-| site_id | UUID | Foreign key to sites |
-| role | TEXT | Either 'admin' or 'editor' |
-| created_at | TIMESTAMPTZ | Creation timestamp |
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_ANON_KEY` | Supabase anonymous/public key |
-| `SUPABASE_SERVICE_KEY` | Supabase service role key (keep secret!) |
-| `GITHUB_PAT` | GitHub Personal Access Token for CMS operations |
+- The GitHub token is stored in the editor's browser (`localStorage`), because Sveltia CMS talks to GitHub directly. That is why it must be a fine-grained token limited to the one repository, with an expiry date.
+- The token is only ever sent to origins listed in `ALLOWED_REDIRECT_ORIGINS`.
+- Sign-in uses Google's authorization-code flow with PKCE and a short-lived `__Host-` state cookie. Only verified Google email addresses are accepted.
 
 ## Troubleshooting
 
-### "User not authorized" error
-- Verify the user's email exists in the `users` table
-- The email must exactly match the Google account email
+### "… is not allowed to edit this site"
+- The Google account's email is not in `ALLOWED_EMAILS`. Check for typos; matching ignores case but nothing else.
+- If the person has several Google accounts, use "Try a different Google account" and pick the right one.
 
-### Google OAuth not working
-- Check that the Supabase callback URL is added to Google Cloud Console authorized redirect URIs
-- Verify Google provider is enabled in Supabase Authentication settings
-- **Important**: If your OAuth consent screen is in "Testing" mode, only users added to the test users list can sign in. To allow any Google user, go to Google Cloud Console → OAuth consent screen → click "Publish App" to move to production
+### "This site is not allowed to use this sign-in service"
+- The origin of `redirect_uri` is not in `ALLOWED_REDIRECT_ORIGINS`. `https://example.com` and `https://www.example.com` are different origins; list both if the site answers on both.
 
-### Redirect issues after auth
-- Ensure the worker callback URL is added to Supabase redirect URLs with wildcard: `https://your-worker.workers.dev/**`
-- The wildcard `**` is required to allow query parameters like `?redirect_uri=...`
-- Check that `redirect_uri` is being passed correctly
+### "The site's GitHub access is not working"
+- `GITHUB_PAT` has expired, was revoked, or cannot write to `GITHUB_REPO`. Run `npm run tail` in `worker/` while signing in to see the exact GitHub response, then rotate the token.
 
-### Local development issues
-- Make sure `.dev.vars` file exists with correct values
-- Add `http://localhost:8787/**` to Supabase redirect URLs (with wildcard)
+### Google shows "redirect_uri_mismatch"
+- Add `https://<your-worker-host>/callback` exactly to the OAuth client's authorized redirect URIs.
+
+### Google OAuth not working for some users
+- The OAuth consent screen is probably still in "Testing" mode. Publish it or add the editors as test users (see step 1). Who may actually sign in is still controlled by `ALLOWED_EMAILS`.
 
 ## Local Development
 
-### Running the Worker
-
 ```bash
 cd worker
-npm run dev
+cp dev.vars.example .dev.vars   # fill in real values; .dev.vars is gitignored
+npm run dev                     # http://localhost:8787
+npm test                        # unit and route tests (Node 22.18+)
+npm run typecheck
 ```
 
-The worker will be available at `http://localhost:8787`.
-
-### Creating New Migrations
-
-```bash
-supabase migration new <migration_name>
-```
-
-This creates a new migration file in `supabase/migrations/`.
+For local sign-in, add `http://localhost:8787/callback` to the Google client's redirect URIs and your local site's origin (e.g. `http://localhost:8080`) to `ALLOWED_REDIRECT_ORIGINS` in `.dev.vars`.
 
 ## License
 

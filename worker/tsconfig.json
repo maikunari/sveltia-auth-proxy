@@ -8,6 +8,7 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"],
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true

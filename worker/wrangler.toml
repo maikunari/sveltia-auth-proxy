@@ -2,14 +2,16 @@ name = "sveltia-auth-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# Keep the Supabase free-tier project from pausing (daily at 09:00 UTC)
+# No scheduled jobs. An empty list removes the old daily Supabase keepalive
+# cron on deploy (omitting [triggers] would leave it in place).
 [triggers]
-crons = ["0 9 * * *"]
+crons = []
 
-[vars]
-# SUPABASE_URL = "https://your-project.supabase.co"
-# SUPABASE_ANON_KEY = "your-anon-key"
-
-# Secrets (set via `wrangler secret put <NAME>`)
-# - SUPABASE_SERVICE_KEY
-# - GITHUB_PAT
+# All configuration is set with `wrangler secret put <NAME>` so that
+# per-site values stay out of this public repo and survive `wrangler deploy`:
+# - GOOGLE_CLIENT_ID
+# - GOOGLE_CLIENT_SECRET
+# - ALLOWED_EMAILS            comma-separated emails allowed to sign in
+# - ALLOWED_REDIRECT_ORIGINS  comma-separated site origins, e.g. https://www.example.com
+# - GITHUB_REPO               owner/repo the CMS edits
+# - GITHUB_PAT                fine-grained PAT scoped to GITHUB_REPO only

@@ -1,7 +1,13 @@
-# Supabase Configuration
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key-here
-SUPABASE_SERVICE_KEY=your-service-role-key-here
+# Google OAuth client (Google Cloud Console → APIs & Services → Credentials)
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-client-secret
 
-# GitHub Personal Access Token (for CMS Git operations)
-GITHUB_PAT=ghp_your-personal-access-token-here
+# Who may sign in (comma-separated Google account emails)
+ALLOWED_EMAILS=editor@example.com,seo@example.com
+
+# Where the token may be sent back to (comma-separated origins, no path)
+ALLOWED_REDIRECT_ORIGINS=http://localhost:8080,https://www.example.com
+
+# The one repository the CMS edits, and a fine-grained PAT scoped to it
+GITHUB_REPO=owner/repo
+GITHUB_PAT=github_pat_your-fine-grained-token
