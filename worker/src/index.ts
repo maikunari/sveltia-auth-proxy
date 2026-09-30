@@ -1,36 +1,55 @@
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-import { createClient } from '@supabase/supabase-js';
+import { Hono, type Context } from 'hono';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+import {
+  base64UrlDecode,
+  base64UrlEncode,
+  decodeJwtPayload,
+  escapeHtml,
+  isEmailAllowed,
+  parseGitHubTokenExpiration,
+  pkceChallenge,
+  randomToken,
+  secondsUntil,
+  validateRedirectUri,
+  verifyGoogleIdTokenClaims,
+  type GoogleIdTokenClaims,
+} from './auth.ts';
 
-type Bindings = {
-  SUPABASE_URL: string;
-  SUPABASE_ANON_KEY: string;
-  SUPABASE_SERVICE_KEY: string;
+export type Bindings = {
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  // Comma-separated emails allowed to sign in, e.g. "editor@example.com,seo@example.com"
+  ALLOWED_EMAILS: string;
+  // Comma-separated origins the token may be sent back to, e.g. "https://www.example.com"
+  ALLOWED_REDIRECT_ORIGINS: string;
+  // The one repository the CMS edits, e.g. "owner/repo"
+  GITHUB_REPO: string;
+  // Fine-grained PAT scoped to GITHUB_REPO (Contents: read and write)
   GITHUB_PAT: string;
 };
 
-type AuthRequest = {
-  token: string;
-  repo: string;
+type Env = { Bindings: Bindings };
+
+type OAuthState = {
+  state: string;
+  verifier: string;
+  redirect: string;
 };
 
-type Site = {
-  id: string;
-  slug: string;
-  github_repo: string;
-};
+const REQUIRED_BINDINGS: (keyof Bindings)[] = [
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'ALLOWED_EMAILS',
+  'ALLOWED_REDIRECT_ORIGINS',
+  'GITHUB_REPO',
+  'GITHUB_PAT',
+];
 
-type User = {
-  id: string;
-  email: string;
-  site_id: string;
-  role: string;
-  sites: Site;
-};
+const STATE_COOKIE = 'sveltia_oauth';
+const STATE_MAX_AGE = 600; // 10 minutes to finish signing in with Google
+const TOKEN_WARNING_DAYS = 14;
 
-const app = new Hono<{ Bindings: Bindings }>();
-
-app.use('*', cors());
+const app = new Hono<Env>();
 
 app.get('/', (c) => {
   return c.json({ message: 'Sveltia Auth Proxy is running' });
@@ -40,601 +59,225 @@ app.get('/health', (c) => {
   return c.json({ status: 'ok' });
 });
 
-// Serve Auth UI page
+// Start sign-in: remember where to return to, then send the user to Google.
 app.get('/auth', async (c) => {
-  const siteSlug = c.req.query('site');
-  const redirectUri = c.req.query('redirect_uri') || '';
-
-  // Fetch site branding if slug provided
-  let branding = {
-    logo_url: null as string | null,
-    brand_name: 'Sign In',
-    primary_color: '#6366f1',
-  };
-
-  if (siteSlug) {
-    const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_KEY);
-    const { data: site } = await supabase
-      .from('sites')
-      .select('logo_url, brand_name, primary_color')
-      .eq('slug', siteSlug)
-      .single();
-
-    if (site) {
-      branding = {
-        logo_url: site.logo_url,
-        brand_name: site.brand_name || 'Sign In',
-        primary_color: site.primary_color || '#6366f1',
-      };
-    }
+  const missing = missingBindings(c.env);
+  if (missing.length > 0) {
+    console.error(`Proxy is missing configuration: ${missing.join(', ')}`);
+    return errorPage(c, 'The sign-in service is not configured yet.', null, 500);
   }
 
-  return c.html(authPageHtml(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY, branding, redirectUri));
-});
-
-// Get site branding
-app.get('/api/site/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_KEY);
-
-  const { data: site, error } = await supabase
-    .from('sites')
-    .select('slug, logo_url, brand_name, primary_color')
-    .eq('slug', slug)
-    .single();
-
-  if (error || !site) {
-    return c.json({ error: 'Site not found' }, 404);
+  const redirect = validateRedirectUri(c.req.query('redirect_uri'), c.env.ALLOWED_REDIRECT_ORIGINS);
+  if (!redirect) {
+    return errorPage(c, 'This site is not allowed to use this sign-in service.', null, 400);
   }
 
-  return c.json(site);
-});
-
-// Handle OAuth callback from Supabase (token in URL fragment)
-app.get('/callback', (c) => {
-  const redirectUri = c.req.query('redirect_uri') || '';
-  // Return HTML that reads the fragment client-side and validates via /callback/validate
-  return c.html(callbackHtml(redirectUri));
-});
-
-// Validate the access token and return GitHub PAT
-app.post('/callback/validate', async (c) => {
-  const { access_token } = await c.req.json<{ access_token: string }>();
-
-  if (!access_token) {
-    return c.json({ error: 'Missing access_token' }, 400);
-  }
-
-  const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_KEY);
-
-  // Validate the token
-  const { data: userData, error: authError } = await supabase.auth.getUser(access_token);
-
-  if (authError || !userData.user) {
-    return c.json({ error: 'Invalid or expired token' }, 401);
-  }
-
-  const email = userData.user.email;
-
-  if (!email) {
-    return c.json({ error: 'No email in token' }, 401);
-  }
-
-  // Validate user exists in users table
-  const { data: user, error: userError } = await supabase
-    .from('users')
-    .select('id, email')
-    .eq('email', email)
-    .single();
-
-  if (userError || !user) {
-    return c.json({ error: 'User not authorized' }, 401);
-  }
-
-  return c.json({
-    success: true,
-    token: c.env.GITHUB_PAT,
-    expires_in: 28800, // 8 hours
+  const oauthState: OAuthState = { state: randomToken(), verifier: randomToken(), redirect };
+  setCookie(c, STATE_COOKIE, base64UrlEncode(new TextEncoder().encode(JSON.stringify(oauthState))), {
+    prefix: 'host',
+    path: '/',
+    secure: true,
+    httpOnly: true,
+    sameSite: 'Lax',
+    maxAge: STATE_MAX_AGE,
   });
+
+  const authorizeUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  authorizeUrl.search = new URLSearchParams({
+    client_id: c.env.GOOGLE_CLIENT_ID,
+    redirect_uri: callbackUrl(c),
+    response_type: 'code',
+    scope: 'openid email',
+    state: oauthState.state,
+    code_challenge: await pkceChallenge(oauthState.verifier),
+    code_challenge_method: 'S256',
+    prompt: 'select_account',
+  }).toString();
+
+  c.header('Cache-Control', 'no-store');
+  return c.redirect(authorizeUrl.toString(), 302);
 });
 
-type SiteBranding = {
-  logo_url: string | null;
-  brand_name: string;
-  primary_color: string;
-};
+// Google redirects here with an authorization code.
+app.get('/callback', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  c.header('Referrer-Policy', 'no-referrer');
 
-function authPageHtml(supabaseUrl: string, supabaseAnonKey: string, branding: SiteBranding, redirectUri: string): string {
-  const logoHtml = branding.logo_url
-    ? `<img src="${branding.logo_url}" alt="${branding.brand_name}" class="logo" />`
+  const saved = readStateCookie(getCookie(c, STATE_COOKIE, 'host'));
+  deleteCookie(c, STATE_COOKIE, { prefix: 'host', path: '/', secure: true });
+
+  const missing = missingBindings(c.env);
+  if (missing.length > 0) {
+    console.error(`Proxy is missing configuration: ${missing.join(', ')}`);
+    return errorPage(c, 'The sign-in service is not configured yet.', null, 500);
+  }
+
+  if (!saved || saved.state !== c.req.query('state')) {
+    return errorPage(c, 'Your sign-in session expired. Please start again from the site.', null, 400);
+  }
+
+  // Re-check in case the allow-list changed during sign-in.
+  const redirect = validateRedirectUri(saved.redirect, c.env.ALLOWED_REDIRECT_ORIGINS);
+  if (!redirect) {
+    return errorPage(c, 'This site is not allowed to use this sign-in service.', null, 400);
+  }
+
+  if (c.req.query('error')) {
+    return errorPage(c, 'Google sign-in was cancelled.', redirect, 400);
+  }
+
+  const code = c.req.query('code');
+  if (!code) {
+    return errorPage(c, 'Google did not return a sign-in code.', redirect, 400);
+  }
+
+  const identity = await exchangeGoogleCode(c, code, saved.verifier);
+  if ('error' in identity) {
+    console.error(`Google sign-in failed: ${identity.error}`);
+    return errorPage(c, 'Google sign-in failed. Please try again.', redirect, 401);
+  }
+
+  if (!isEmailAllowed(identity.email, c.env.ALLOWED_EMAILS)) {
+    console.warn(`Sign-in refused for ${identity.email}: not on ALLOWED_EMAILS`);
+    return errorPage(
+      c,
+      `${identity.email} is not allowed to edit this site. Sign in with the Google account the site owner added, or ask them to add this one.`,
+      redirect,
+      403,
+    );
+  }
+
+  const github = await checkGitHubToken(c.env);
+  if ('error' in github) {
+    console.error(`GitHub token check failed: ${github.error}`);
+    return errorPage(
+      c,
+      'You are signed in, but the site’s GitHub access is not working (the token may have expired). Please contact the site administrator.',
+      redirect,
+      502,
+    );
+  }
+
+  const params = new URLSearchParams({ auth_token: c.env.GITHUB_PAT });
+  const expiresIn = secondsUntil(github.expiresAt, Date.now());
+  if (expiresIn !== null) params.set('expires_in', String(expiresIn));
+
+  return c.redirect(`${redirect}#${params.toString()}`, 302);
+});
+
+function missingBindings(env: Bindings): string[] {
+  return REQUIRED_BINDINGS.filter((name) => !env[name]);
+}
+
+function callbackUrl(c: Context<Env>): string {
+  return `${new URL(c.req.url).origin}/callback`;
+}
+
+function readStateCookie(value: string | undefined): OAuthState | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(base64UrlDecode(value)));
+    if (typeof parsed.state !== 'string' || typeof parsed.verifier !== 'string' || typeof parsed.redirect !== 'string') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function exchangeGoogleCode(
+  c: Context<Env>,
+  code: string,
+  verifier: string,
+): Promise<{ email: string } | { error: string }> {
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: c.env.GOOGLE_CLIENT_ID,
+      client_secret: c.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: callbackUrl(c),
+      grant_type: 'authorization_code',
+      code_verifier: verifier,
+    }),
+  });
+
+  if (!response.ok) {
+    return { error: `token endpoint returned ${response.status}: ${await response.text()}` };
+  }
+
+  const { id_token } = await response.json<{ id_token?: string }>();
+  if (!id_token) return { error: 'token response had no id_token' };
+
+  const claims = decodeJwtPayload(id_token) as GoogleIdTokenClaims | null;
+  return verifyGoogleIdTokenClaims(claims, c.env.GOOGLE_CLIENT_ID, Date.now());
+}
+
+// Confirms the PAT can still write to GITHUB_REPO and reads its expiry, so a
+// dead token shows a clear error instead of a broken CMS.
+async function checkGitHubToken(env: Bindings): Promise<{ expiresAt: number | null } | { error: string }> {
+  const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${env.GITHUB_PAT}`,
+      'User-Agent': 'sveltia-auth-proxy',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+
+  if (!response.ok) {
+    return { error: `GET /repos/${env.GITHUB_REPO} returned ${response.status}` };
+  }
+
+  const repo = await response.json<{ permissions?: { push?: boolean } }>();
+  if (!repo.permissions?.push) {
+    return { error: `token cannot write to ${env.GITHUB_REPO}` };
+  }
+
+  const expiresAt = parseGitHubTokenExpiration(response.headers.get('github-authentication-token-expiration'));
+  if (expiresAt === null) {
+    console.warn('GITHUB_PAT has no expiry date; replace it with an expiring fine-grained token');
+  } else if (expiresAt - Date.now() < TOKEN_WARNING_DAYS * 86_400_000) {
+    console.warn(`GITHUB_PAT expires on ${new Date(expiresAt).toISOString()}; rotate it soon`);
+  }
+
+  return { expiresAt };
+}
+
+function errorPage(c: Context<Env>, message: string, redirect: string | null, status: 400 | 401 | 403 | 500 | 502) {
+  const retry = redirect ? `/auth?redirect_uri=${encodeURIComponent(redirect)}` : null;
+  const links = redirect
+    ? `<p><a href="${escapeHtml(retry!)}">Try a different Google account</a> · <a href="${escapeHtml(redirect)}">Back to the site</a></p>`
     : '';
 
-  return `<!DOCTYPE html>
-<html>
+  c.header('Cache-Control', 'no-store');
+  return c.html(
+    `<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${branding.brand_name} - Sign In</title>
-  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <title>Sign-in problem</title>
   <style>
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-      background: #f5f5f5;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .container {
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-      padding: 40px;
-      width: 100%;
-      max-width: 400px;
-    }
-    .header {
-      text-align: center;
-      margin-bottom: 32px;
-    }
-    .logo {
-      max-width: 120px;
-      max-height: 60px;
-      margin-bottom: 16px;
-    }
-    .brand-name {
-      font-size: 24px;
-      font-weight: 600;
-      color: #333;
-    }
-    .divider {
-      display: flex;
-      align-items: center;
-      margin: 24px 0;
-      color: #666;
-      font-size: 14px;
-    }
-    .divider::before, .divider::after {
-      content: '';
-      flex: 1;
-      border-bottom: 1px solid #e0e0e0;
-    }
-    .divider span {
-      padding: 0 16px;
-    }
-    .auth-button {
-      width: 100%;
-      padding: 12px 16px;
-      border: 1px solid #e0e0e0;
-      border-radius: 8px;
-      background: white;
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      transition: background 0.2s, border-color 0.2s;
-      margin-bottom: 12px;
-    }
-    .auth-button:hover {
-      background: #f9f9f9;
-      border-color: #ccc;
-    }
-    .auth-button.primary {
-      background: ${branding.primary_color};
-      color: white;
-      border-color: ${branding.primary_color};
-    }
-    .auth-button.primary:hover {
-      opacity: 0.9;
-    }
-    .auth-button svg {
-      width: 20px;
-      height: 20px;
-    }
-    .form-group {
-      margin-bottom: 16px;
-    }
-    .form-group label {
-      display: block;
-      font-size: 14px;
-      font-weight: 500;
-      color: #333;
-      margin-bottom: 6px;
-    }
-    .form-group input {
-      width: 100%;
-      padding: 12px;
-      border: 1px solid #e0e0e0;
-      border-radius: 8px;
-      font-size: 14px;
-      transition: border-color 0.2s;
-    }
-    .form-group input:focus {
-      outline: none;
-      border-color: ${branding.primary_color};
-    }
-    .error-message {
-      color: #dc2626;
-      font-size: 14px;
-      margin-top: 8px;
-      display: none;
-    }
-    .success-message {
-      color: #16a34a;
-      font-size: 14px;
-      margin-top: 8px;
-      display: none;
-    }
-    .tabs {
-      display: flex;
-      margin-bottom: 24px;
-      border-bottom: 1px solid #e0e0e0;
-    }
-    .tab {
-      flex: 1;
-      padding: 12px;
-      text-align: center;
-      font-size: 14px;
-      font-weight: 500;
-      color: #666;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      transition: color 0.2s, border-color 0.2s;
-    }
-    .tab.active {
-      color: ${branding.primary_color};
-      border-bottom-color: ${branding.primary_color};
-    }
-    .tab-content {
-      display: none;
-    }
-    .tab-content.active {
-      display: block;
-    }
-    .loading {
-      text-align: center;
-      padding: 20px;
-      color: #666;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
+    main { background: #fff; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); padding: 32px; max-width: 440px; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    p { line-height: 1.5; margin: 0 0 12px; overflow-wrap: anywhere; }
+    a { color: #4f46e5; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      ${logoHtml}
-      <div class="brand-name">${branding.brand_name}</div>
-    </div>
-
-    <button id="google-btn" class="auth-button" type="button">
-      <svg viewBox="0 0 24 24">
-        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-      </svg>
-      Continue with Google
-    </button>
-
-    <div class="divider"><span>or</span></div>
-
-    <div class="tabs">
-      <div id="tab-email" class="tab active">Email</div>
-      <div id="tab-magic" class="tab">Magic Link</div>
-    </div>
-
-    <div id="email-tab" class="tab-content active">
-      <div class="form-group">
-        <label for="email">Email</label>
-        <input type="email" id="email" placeholder="you@example.com" />
-      </div>
-      <div class="form-group">
-        <label for="password">Password</label>
-        <input type="password" id="password" placeholder="Your password" />
-      </div>
-      <button id="email-btn" class="auth-button primary" type="button">Sign In</button>
-    </div>
-
-    <div id="magic-tab" class="tab-content">
-      <div class="form-group">
-        <label for="magic-email">Email</label>
-        <input type="email" id="magic-email" placeholder="you@example.com" />
-      </div>
-      <button id="magic-btn" class="auth-button primary" type="button">Send Magic Link</button>
-    </div>
-
-    <div id="error" class="error-message"></div>
-    <div id="success" class="success-message"></div>
-  </div>
-
-  <script>
-    const SUPABASE_URL = '${supabaseUrl}';
-    const SUPABASE_ANON_KEY = '${supabaseAnonKey}';
-    const REDIRECT_URI = '${redirectUri}';
-    const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
-    // Build callback URL with redirect_uri preserved
-    function getCallbackUrl() {
-      let callbackUrl = window.location.origin + '/callback';
-      if (REDIRECT_URI) {
-        callbackUrl += '?redirect_uri=' + encodeURIComponent(REDIRECT_URI);
-      }
-      return callbackUrl;
-    }
-
-    // Redirect to the final destination with token
-    function redirectWithToken(token, expiresIn) {
-      if (REDIRECT_URI) {
-        const url = REDIRECT_URI + '#auth_token=' + encodeURIComponent(token) + '&expires_in=' + expiresIn;
-        window.location.href = url;
-      } else {
-        showSuccess('Authentication successful! You can close this window.');
-      }
-    }
-
-    // Redirect with error
-    function redirectWithError(error) {
-      if (REDIRECT_URI) {
-        const url = REDIRECT_URI + '#auth_error=' + encodeURIComponent(error);
-        window.location.href = url;
-      } else {
-        showError(error);
-      }
-    }
-
-    // Listen for auth state changes
-    supabaseClient.auth.onAuthStateChange(async (event, session) => {
-      if (event === 'SIGNED_IN' && session) {
-        // Validate user and get GitHub PAT
-        try {
-          const response = await fetch('/callback/validate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ access_token: session.access_token })
-          });
-
-          const data = await response.json();
-
-          if (!response.ok || !data.success) {
-            throw new Error(data.error || 'Validation failed');
-          }
-
-          // Redirect back to the site with token
-          redirectWithToken(data.token, data.expires_in);
-        } catch (error) {
-          redirectWithError(error.message);
-        }
-      }
-    });
-
-    function showTab(tab) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      document.getElementById('tab-' + tab).classList.add('active');
-      document.getElementById(tab + '-tab').classList.add('active');
-      hideMessages();
-    }
-
-    function showError(message) {
-      const el = document.getElementById('error');
-      el.textContent = message;
-      el.style.display = 'block';
-      document.getElementById('success').style.display = 'none';
-    }
-
-    function showSuccess(message) {
-      const el = document.getElementById('success');
-      el.textContent = message;
-      el.style.display = 'block';
-      document.getElementById('error').style.display = 'none';
-    }
-
-    function hideMessages() {
-      document.getElementById('error').style.display = 'none';
-      document.getElementById('success').style.display = 'none';
-    }
-
-    async function signInWithGoogle() {
-      hideMessages();
-      const { error } = await supabaseClient.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: getCallbackUrl()
-        }
-      });
-      if (error) showError(error.message);
-    }
-
-    async function signInWithEmail() {
-      hideMessages();
-      const email = document.getElementById('email').value;
-      const password = document.getElementById('password').value;
-
-      if (!email || !password) {
-        showError('Please enter email and password');
-        return;
-      }
-
-      const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-      if (error) showError(error.message);
-    }
-
-    async function signInWithMagicLink() {
-      hideMessages();
-      const email = document.getElementById('magic-email').value;
-
-      if (!email) {
-        showError('Please enter your email');
-        return;
-      }
-
-      const { error } = await supabaseClient.auth.signInWithOtp({
-        email,
-        options: {
-          emailRedirectTo: getCallbackUrl()
-        }
-      });
-      if (error) {
-        showError(error.message);
-      } else {
-        showSuccess('Check your email for the magic link!');
-      }
-    }
-
-    // Attach event listeners when DOM is ready
-    document.addEventListener('DOMContentLoaded', function() {
-      document.getElementById('google-btn').addEventListener('click', signInWithGoogle);
-      document.getElementById('email-btn').addEventListener('click', signInWithEmail);
-      document.getElementById('magic-btn').addEventListener('click', signInWithMagicLink);
-      document.getElementById('tab-email').addEventListener('click', function() { showTab('email'); });
-      document.getElementById('tab-magic').addEventListener('click', function() { showTab('magic'); });
-
-      // Allow Enter key to submit forms
-      document.getElementById('password').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') signInWithEmail();
-      });
-      document.getElementById('magic-email').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') signInWithMagicLink();
-      });
-    });
-  </script>
+  <main>
+    <h1>Couldn’t sign you in</h1>
+    <p>${escapeHtml(message)}</p>
+    ${links}
+  </main>
 </body>
-</html>`;
+</html>`,
+    status,
+  );
 }
 
-function callbackHtml(redirectUri: string): string {
-  return `<!DOCTYPE html>
-<html>
-<head><title>Authenticating...</title></head>
-<body>
-<p>Authenticating...</p>
-<script>
-(async function() {
-  const REDIRECT_URI = '${redirectUri}';
-
-  function redirectWithToken(token, expiresIn) {
-    if (REDIRECT_URI) {
-      const url = REDIRECT_URI + '#auth_token=' + encodeURIComponent(token) + '&expires_in=' + expiresIn;
-      window.location.href = url;
-    } else {
-      document.body.innerHTML = '<p>Authentication successful! You can close this window.</p>';
-    }
-  }
-
-  function redirectWithError(error) {
-    if (REDIRECT_URI) {
-      const url = REDIRECT_URI + '#auth_error=' + encodeURIComponent(error);
-      window.location.href = url;
-    } else {
-      document.body.innerHTML = '<p>Authentication failed: ' + error + '</p>';
-    }
-  }
-
-  try {
-    // Parse the URL fragment
-    const hash = window.location.hash.substring(1);
-    const params = new URLSearchParams(hash);
-    const accessToken = params.get('access_token');
-
-    if (!accessToken) {
-      throw new Error('No access token in URL');
-    }
-
-    // Validate token with the server
-    const response = await fetch('/callback/validate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: accessToken })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok || !data.success) {
-      throw new Error(data.error || 'Validation failed');
-    }
-
-    // Redirect back to the site with token
-    redirectWithToken(data.token, data.expires_in);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    redirectWithError(errorMessage);
-  }
-})();
-</script>
-</body>
-</html>`;
-}
-
-app.post('/auth', async (c) => {
-  const body = await c.req.json<AuthRequest>();
-  const { token, repo } = body;
-
-  if (!token || !repo) {
-    return c.json({ error: 'Missing token or repo' }, 400);
-  }
-
-  const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_KEY);
-
-  // Validate JWT and extract user info
-  const { data: userData, error: authError } = await supabase.auth.getUser(token);
-
-  if (authError || !userData.user) {
-    return c.json({ error: 'Invalid or expired token' }, 401);
-  }
-
-  const email = userData.user.email;
-
-  if (!email) {
-    return c.json({ error: 'No email in token' }, 401);
-  }
-
-  // Look up user and their associated site
-  const { data: user, error: userError } = await supabase
-    .from('users')
-    .select('id, email, site_id, role, sites(id, slug, github_repo)')
-    .eq('email', email)
-    .single();
-
-  if (userError || !user) {
-    return c.json({ error: 'User not found' }, 401);
-  }
-
-  const typedUser = user as unknown as User;
-
-  // Verify the requested repo matches the user's allowed site
-  if (typedUser.sites.github_repo !== repo) {
-    return c.json({ error: 'Unauthorized for this repository' }, 401);
-  }
-
-  return c.json({
-    access_token: c.env.GITHUB_PAT,
-    token_type: 'bearer',
-  });
-});
-
-// Cron-triggered keepalive: Supabase pauses free projects after ~7 days
-// without database activity, and health-check endpoints don't count.
-// A real query against a table does.
-async function keepSupabaseAlive(env: Bindings) {
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  const { error } = await supabase.from('sites').select('id').limit(1);
-  if (error) {
-    throw new Error(`Supabase keepalive query failed: ${error.message}`);
-  }
-  console.log('Supabase keepalive query succeeded');
-}
-
-export default {
-  fetch: app.fetch,
-  scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
-    ctx.waitUntil(keepSupabaseAlive(env));
-  },
-};
+export default app;
